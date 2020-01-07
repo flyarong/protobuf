@@ -6,6 +6,8 @@
 
 # For when some other test needs the C++ main build, including protoc and
 # libprotobuf.
+LAST_RELEASED=3.9.0
+
 internal_build_cpp() {
   if [ -f src/protoc ]; then
     # Already built.
@@ -18,12 +20,12 @@ internal_build_cpp() {
   ./autogen.sh
   ./configure CXXFLAGS="-fPIC -std=c++11"  # -fPIC is needed for python cpp test.
                                            # See python/setup.py for more details
-  make -j4
+  make -j$(nproc)
 }
 
 build_cpp() {
   internal_build_cpp
-  make check -j4 || (cat src/test-suite.log; false)
+  make check -j$(nproc) || (cat src/test-suite.log; false)
   cd conformance && make test_cpp && cd ..
 
   # The benchmark code depends on cmake, so test if it is installed before
@@ -38,7 +40,20 @@ build_cpp() {
   fi
 }
 
+build_cpp_tcmalloc() {
+  internal_build_cpp
+  ./configure LIBS=-ltcmalloc && make clean && make \
+      PTHREAD_CFLAGS='-pthread -DGOOGLE_PROTOBUF_HEAP_CHECK_DRACONIAN' \
+      check
+  cd src
+  PPROF_PATH=/usr/bin/google-pprof HEAPCHECK=strict ./protobuf-test
+}
+
 build_cpp_distcheck() {
+  grep -q -- "-Og" src/Makefile.am &&
+    echo "The -Og flag is incompatible with Clang versions older than 4.0." &&
+    exit 1
+
   # Initialize any submodules.
   git submodule update --init --recursive
   ./autogen.sh
@@ -47,7 +62,7 @@ build_cpp_distcheck() {
 
   # List all files that should be included in the distribution package.
   git ls-files | grep "^\(java\|python\|objectivec\|csharp\|js\|ruby\|php\|cmake\|examples\|src/google/protobuf/.*\.proto\)" |\
-    grep -v ".gitignore" | grep -v "java/compatibility_tests" |\
+    grep -v ".gitignore" | grep -v "java/compatibility_tests" | grep -v "java/lite/proguard.pgcfg" |\
     grep -v "python/compatibility_tests" | grep -v "csharp/compatibility_tests" > dist.lst
   # Unzip the dist tar file.
   DIST=`ls *.tar.gz`
@@ -68,7 +83,39 @@ build_cpp_distcheck() {
   fi
 
   # Do the regular dist-check for C++.
-  make distcheck -j4
+  make distcheck -j$(nproc)
+}
+
+build_dist_install() {
+  # Initialize any submodules.
+  git submodule update --init --recursive
+  ./autogen.sh
+  ./configure
+  make dist
+
+  # Unzip the dist tar file and install it.
+  DIST=`ls *.tar.gz`
+  tar -xf $DIST
+  pushd ${DIST//.tar.gz}
+  ./configure && make check -j4 && make install
+
+  export LD_LIBRARY_PATH=/usr/local/lib
+
+  # Try to install Java
+  pushd java
+  use_java jdk7
+  $MVN install
+  popd
+
+  # Try to install Python
+  virtualenv --no-site-packages venv
+  source venv/bin/activate
+  pushd python
+  python setup.py clean build sdist
+  pip install dist/protobuf-*.tar.gz
+  popd
+  deactivate
+  rm -rf python/venv
 }
 
 build_csharp() {
@@ -76,6 +123,12 @@ build_csharp() {
   internal_build_cpp
   NUGET=/usr/local/bin/nuget.exe
 
+  # Disable some unwanted dotnet options
+  export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=true
+  export DOTNET_CLI_TELEMETRY_OPTOUT=true
+
+  # TODO(jtattermusch): is this still needed with "first time experience"
+  # disabled?
   # Perform "dotnet new" once to get the setup preprocessing out of the
   # way. That spews a lot of output (including backspaces) into logs
   # otherwise, and can cause problems. It doesn't matter if this step
@@ -96,6 +149,9 @@ build_csharp() {
 
   # Run csharp compatibility test between 3.0.0 and the current version.
   csharp/compatibility_tests/v3.0.0/test.sh 3.0.0
+
+  # Run csharp compatibility test between last released and the current version.
+  csharp/compatibility_tests/v3.0.0/test.sh $LAST_RELEASED
 }
 
 build_golang() {
@@ -117,6 +173,10 @@ build_golang() {
 use_java() {
   version=$1
   case "$version" in
+    jdk8)
+      export PATH=/usr/lib/jvm/java-8-openjdk-amd64/bin:$PATH
+      export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+      ;;
     jdk7)
       export PATH=/usr/lib/jvm/java-7-openjdk-amd64/bin:$PATH
       export JAVA_HOME=/usr/lib/jvm/java-7-openjdk-amd64
@@ -153,6 +213,9 @@ build_java() {
 build_java_with_conformance_tests() {
   # Java build needs `protoc`.
   internal_build_cpp
+  # This local installation avoids the problem caused by a new version not yet in Maven Central
+  cd java/bom && $MVN install
+  cd ../..
   cd java && $MVN test && $MVN install
   cd util && $MVN package assembly:single
   cd ../..
@@ -174,17 +237,36 @@ build_java_compatibility() {
   # 3.0.0-beta-4 and the current version.
   cd java/compatibility_tests/v2.5.0
   ./test.sh 3.0.0-beta-4
+
+  # Test the last released and current version.
+  ./test.sh $LAST_RELEASED
+}
+build_java_linkage_monitor() {
+  # Linkage Monitor checks compatibility with other Google libraries
+  # https://github.com/GoogleCloudPlatform/cloud-opensource-java/tree/master/linkage-monitor
+
+  use_java jdk8
+  internal_build_cpp
+
+  # Linkage Monitor uses $HOME/.m2 local repository
+  MVN="mvn -e -B -Dhttps.protocols=TLSv1.2"
+  cd java
+  # Installs the snapshot version locally
+  $MVN install -Dmaven.test.skip=true
+
+  # Linkage Monitor uses the snapshot versions installed in $HOME/.m2 to verify compatibility
+  JAR=linkage-monitor-latest-all-deps.jar
+  curl -v -O "https://storage.googleapis.com/cloud-opensource-java-linkage-monitor/${JAR}"
+  # Fails if there's new linkage errors compared with baseline
+  java -jar $JAR com.google.cloud:libraries-bom
 }
 
 build_objectivec_ios() {
   # Reused the build script that takes care of configuring and ensuring things
   # are up to date.  The OS X test runs the objc conformance test, so skip it
   # here.
-  # Note: travis has xctool installed, and we've looked at using it in the past
-  # but it has ended up proving unreliable (bugs), an they are removing build
-  # support in favor of xcbuild (or just xcodebuild).
   objectivec/DevTools/full_mac_build.sh \
-      --core-only --skip-xcode-osx --skip-objc-conformance "$@"
+      --core-only --skip-xcode-osx --skip-xcode-tvos --skip-objc-conformance "$@"
 }
 
 build_objectivec_ios_debug() {
@@ -199,12 +281,28 @@ build_objectivec_osx() {
   # Reused the build script that takes care of configuring and ensuring things
   # are up to date.
   objectivec/DevTools/full_mac_build.sh \
-      --core-only --skip-xcode-ios
+      --core-only --skip-xcode-ios --skip-xcode-tvos
+}
+
+build_objectivec_tvos() {
+  # Reused the build script that takes care of configuring and ensuring things
+  # are up to date.  The OS X test runs the objc conformance test, so skip it
+  # here.
+  objectivec/DevTools/full_mac_build.sh \
+      --core-only --skip-xcode-ios --skip-xcode-osx --skip-objc-conformance "$@"
+}
+
+build_objectivec_tvos_debug() {
+  build_objectivec_tvos --skip-xcode-release
+}
+
+build_objectivec_tvos_release() {
+  build_objectivec_tvos --skip-xcode-debug
 }
 
 build_objectivec_cocoapods_integration() {
   # Update pod to the latest version.
-  gem install cocoapods --no-ri --no-rdoc
+  gem install cocoapods --no_document
   objectivec/Tests/CocoaPods/run_tests.sh
 }
 
@@ -308,6 +406,9 @@ build_python_compatibility() {
   ./test.sh 2.5.0
   # Test between 3.0.0-beta-1 and the current version.
   ./test.sh 3.0.0-beta-1
+
+  # Test between last released and current version.
+  ./test.sh $LAST_RELEASED
 }
 
 build_ruby23() {
@@ -413,6 +514,16 @@ build_php5.5_c() {
   # popd
 }
 
+build_php5.5_mixed() {
+  use_php 5.5
+  pushd php
+  rm -rf vendor
+  composer update
+  /bin/bash ./tests/compile_extension.sh ./ext/google/protobuf
+  php -dextension=./ext/google/protobuf/modules/protobuf.so ./vendor/bin/phpunit
+  popd
+}
+
 build_php5.5_zts_c() {
   use_php_zts 5.5
   cd php/tests && /bin/bash ./test.sh 5.5-zts && cd ../..
@@ -443,6 +554,16 @@ build_php5.6_c() {
   # popd
 }
 
+build_php5.6_mixed() {
+  use_php 5.6
+  pushd php
+  rm -rf vendor
+  composer update
+  /bin/bash ./tests/compile_extension.sh ./ext/google/protobuf
+  php -dextension=./ext/google/protobuf/modules/protobuf.so ./vendor/bin/phpunit
+  popd
+}
+
 build_php5.6_zts_c() {
   use_php_zts 5.6
   cd php/tests && /bin/bash ./test.sh 5.6-zts && cd ../..
@@ -460,7 +581,7 @@ build_php5.6_mac() {
   export PATH="$PHP_FOLDER/bin:$PATH"
 
   # Install phpunit
-  curl https://phar.phpunit.de/phpunit-5.6.10.phar -L -o phpunit.phar
+  curl https://phar.phpunit.de/phpunit-5.6.8.phar -L -o phpunit.phar
   chmod +x phpunit.phar
   sudo mv phpunit.phar /usr/local/bin/phpunit
 
@@ -496,6 +617,16 @@ build_php7.0_c() {
   # pushd conformance
   # make test_php_c
   # popd
+}
+
+build_php7.0_mixed() {
+  use_php 7.0
+  pushd php
+  rm -rf vendor
+  composer update
+  /bin/bash ./tests/compile_extension.sh ./ext/google/protobuf
+  php -dextension=./ext/google/protobuf/modules/protobuf.so ./vendor/bin/phpunit
+  popd
 }
 
 build_php7.0_zts_c() {
@@ -534,7 +665,7 @@ build_php7.0_mac() {
 
 build_php_compatibility() {
   internal_build_cpp
-  php/tests/compatibility_test.sh
+  php/tests/compatibility_test.sh $LAST_RELEASED
 }
 
 build_php7.1() {
@@ -561,6 +692,16 @@ build_php7.1_c() {
   fi
 }
 
+build_php7.1_mixed() {
+  use_php 7.1
+  pushd php
+  rm -rf vendor
+  composer update
+  /bin/bash ./tests/compile_extension.sh ./ext/google/protobuf
+  php -dextension=./ext/google/protobuf/modules/protobuf.so ./vendor/bin/phpunit
+  popd
+}
+
 build_php7.1_zts_c() {
   use_php_zts 7.1
   cd php/tests && /bin/bash ./test.sh 7.1-zts && cd ../..
@@ -578,6 +719,10 @@ build_php_all_32() {
   build_php5.6_c
   build_php7.0_c
   build_php7.1_c $1
+  build_php5.5_mixed
+  build_php5.6_mixed
+  build_php7.0_mixed
+  build_php7.1_mixed
   build_php5.5_zts_c
   build_php5.6_zts_c
   build_php7.0_zts_c
@@ -604,10 +749,14 @@ Usage: $0 { cpp |
             java_jdk7 |
             java_oracle7 |
             java_compatibility |
+            java_linkage_monitor |
             objectivec_ios |
             objectivec_ios_debug |
             objectivec_ios_release |
             objectivec_osx |
+            objectivec_tvos |
+            objectivec_tvos_debug |
+            objectivec_tvos_release |
             objectivec_cocoapods_integration |
             python |
             python_cpp |
@@ -628,6 +777,7 @@ Usage: $0 { cpp |
             php7.1   |
             php7.1_c |
             php_all |
+            dist_install |
             benchmark)
 "
   exit 1

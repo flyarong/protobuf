@@ -43,7 +43,7 @@
 namespace google {
 namespace protobuf {
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && _MSC_VER < 1800
 #define strtoll  _strtoi64
 #define strtoull _strtoui64
 #elif defined(__DECCXX) && defined(__osf__)
@@ -159,8 +159,6 @@ inline string StripSuffixString(const string& str, const string& suffix) {
 // ----------------------------------------------------------------------
 PROTOBUF_EXPORT void ReplaceCharacters(string* s, const char* remove,
                                        char replacewith);
-PROTOBUF_EXPORT void StripString(string* s, const char* remove,
-                                 char replacewith);
 
 PROTOBUF_EXPORT void StripWhitespace(string* s);
 
@@ -620,16 +618,26 @@ struct PROTOBUF_EXPORT AlphaNum {
   // No bool ctor -- bools convert to an integral type.
   // A bool ctor would also convert incoming pointers (bletch).
 
-  AlphaNum(int32 i32)
+  AlphaNum(int i32)
       : piece_data_(digits),
         piece_size_(FastInt32ToBufferLeft(i32, digits) - &digits[0]) {}
-  AlphaNum(uint32 u32)
+  AlphaNum(unsigned int u32)
       : piece_data_(digits),
         piece_size_(FastUInt32ToBufferLeft(u32, digits) - &digits[0]) {}
-  AlphaNum(int64 i64)
+  AlphaNum(long long i64)
       : piece_data_(digits),
         piece_size_(FastInt64ToBufferLeft(i64, digits) - &digits[0]) {}
-  AlphaNum(uint64 u64)
+  AlphaNum(unsigned long long u64)
+      : piece_data_(digits),
+        piece_size_(FastUInt64ToBufferLeft(u64, digits) - &digits[0]) {}
+
+  // Note: on some architectures, "long" is only 32 bits, not 64, but the
+  // performance hit of using FastInt64ToBufferLeft to handle 32-bit values
+  // is quite minor.
+  AlphaNum(long i64)
+      : piece_data_(digits),
+        piece_size_(FastInt64ToBufferLeft(i64, digits) - &digits[0]) {}
+  AlphaNum(unsigned long u64)
       : piece_data_(digits),
         piece_size_(FastUInt64ToBufferLeft(u64, digits) - &digits[0]) {}
 
@@ -921,6 +929,14 @@ inline bool EndsWith(StringPiece text, StringPiece suffix) {
               suffix.size()) == 0);
 }
 }  // namespace strings
+
+namespace internal {
+
+// A locale-independent version of the standard strtod(), which always
+// uses a dot as the decimal separator.
+double NoLocaleStrtod(const char* str, char** endptr);
+
+}  // namespace internal
 
 }  // namespace protobuf
 }  // namespace google
